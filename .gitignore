@@ -11,3 +11,10 @@ htmlcov/
 .DS_Store
 .vscode/
 .idea/
+access_events.log
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+.vs/

@@ -1,95 +1,78 @@
-
 # Edge AI Access Control PoC
 
-A lightweight and deterministic face-recognition access-gate simulation. The
-computer-vision stages are mocked with file metadata and reproducible NumPy
-vectors. Request validation, cosine matching, policy decisions, the REST API,
-and single-line JSON audit logging are fully implemented.
+## Обзор
 
-## Requirements
+PoC моделирует обработку одного кадра с Edge-камеры для управления
+турникетом. Конвейер выполняет проверку качества по дисперсии Лапласиана,
+детекцию и выравнивание лица, ONNX-инференс liveness и 512-мерного
+эмбеддинга, поиск ближайшего сотрудника через FAISS `IndexFlatIP`, проверку
+локальных прав доступа и fail-safe принятие решения.
 
-- Python 3.11 or newer
+Используются компактные ONNX-модели из `assets/`, OpenCV, ONNX Runtime и
+FAISS. Решения могут быть `allow`, `deny` или `manual_review`; турникет
+открывается только при успешном прохождении всех проверок.
 
-## Setup
+## Требования и установка
+
+- Python 3.11 или новее
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
-## Run the five reference scenarios
+При необходимости модели можно пересоздать:
 
 ```bash
-python demo_runner.py
+python3 scripts/download_or_build_models.py
 ```
 
-The runner validates scenarios `e-1001` through `e-1005`, prints one JSON
-response per scenario, and appends one JSON audit record per line to
-`access_events.log`.
+## Запуск
 
-## Run the API
+1. Перейдите в корень репозитория.
+2. Активируйте виртуальное окружение.
+3. Запустите демонстрационные сценарии:
+
+```bash
+python3 demo_runner.py
+```
+
+Скрипт проверит ожидаемые решения, выведет JSON для каждого события и
+завершится сообщением:
+
+```json
+{"scenarios": 5, "status": "success"}
+```
+
+REST API запускается отдельно:
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Check service health:
+Доступны `GET /health` и `POST /v1/access/verify`.
 
-```bash
-curl http://localhost:8000/health
-```
+## Тестовые сценарии
 
-Submit a verification event:
+| Событие | Проверка | Решение | Команда турникету |
+|---|---|---|---|
+| `e-1001` | Качественный кадр, живое лицо, уверенное совпадение и действующие права | `allow` | `open` |
+| `e-1002` | Низкое качество и перекрытие лица | `manual_review` | `keep_closed` |
+| `e-1003` | Провал liveness, имитация spoofing-атаки | `manual_review` | `keep_closed` |
+| `e-1004` | Слишком малая разница между двумя лучшими кандидатами | `manual_review` | `keep_closed` |
+| `e-1005` | Offline-режим и кэш старше 120 минут | `manual_review` | `keep_closed` |
 
-```bash
-curl -X POST http://localhost:8000/v1/access/verify \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "event_id": "e-api-1",
-    "image_path": "simulated/emp-4821-entry.jpg",
-    "occurred_at": "2026-08-15T09:00:00Z",
-    "metadata": {
-      "network": "online",
-      "cache_age_minutes": 0,
-      "lighting": "normal",
-      "occlusion_hint": null,
-      "spoofing_suspected": false
-    }
-  }'
-```
+## Аудит
 
-## Decision policy
+Каждая новая проверка добавляет одну JSON-строку в `access_events.log`.
+Журнал содержит:
 
-Automatic access requires quality at least `0.50`, liveness at least `0.80`,
-cosine match score at least `0.75`, and a top-two margin at least `0.10`.
-Offline operation additionally requires the edge cache to be no older than
-120 minutes. Any failed gate keeps the turnstile closed and requests manual
-review.
+- `trace_id`, `event_id`, `timestamp`, `gate_id`, `camera_id`;
+- идентификатор найденного сотрудника;
+- оценки качества, liveness и сходства;
+- итоговое решение, причины и команду турникету;
+- наблюдение лица и задержки этапов конвейера в миллисекундах.
 
-The pipeline is a cascade. If image quality fails, later liveness and matching
-stages are not evaluated. If liveness fails, matching is not evaluated. This
-keeps audit reasons tied to stages that actually ran.
-
-## Simulated CV behavior
-
-Supported image suffixes are treated as readable simulation inputs when the
-file does not exist. Existing files are verified with Pillow. Normal readable
-inputs score `0.88` for quality and `0.95` for liveness. Dim lighting,
-backlighting, occlusion, and spoofing metadata lower the corresponding score.
-
-Image paths containing `emp-4821` deterministically produce a candidate near
-the authorized employee embedding. A path containing `close-second` produces
-two close matches. Other paths produce deterministic candidates seeded by the
-image path and event ID.
-
-## Project layout
-
-```text
-app/main.py       FastAPI entrypoint
-app/schemas.py    Request and response models
-app/pipeline.py   Policy decision engine
-app/mock_cv.py    Deterministic simulated CV and matching
-app/logger.py     Structured JSON audit writer
-demo_runner.py    Reference scenario runner
-```
+Повторный `event_id` возвращает сохранённый результат без повторной записи.
+Файл журнала является runtime-артефактом и исключён из Git.

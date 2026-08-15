@@ -4,6 +4,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 from numpy.typing import NDArray
 from PIL import Image
 
@@ -63,11 +64,11 @@ class ImageLoadError(ValueError):
     pass
 
 
-class MockCVEngine:
+class OnnxCVEngine:
     quality_stage_name = "Laplacian Quality Gate"
-    detection_stage_name = "SCRFD"
-    liveness_stage_name = "MiniFASNetV2"
-    embedding_stage_name = "ArcFace ResNet-50"
+    detection_stage_name = "SCRFD ONNX Runtime"
+    liveness_stage_name = "MiniFASNetV2 ONNX Runtime"
+    embedding_stage_name = "ArcFace ResNet-50 ONNX Runtime"
     vector_search_stage_name = "FAISS IndexFlatIP"
     canonical_face_size = (112, 112)
     simulated_scenarios = {
@@ -78,14 +79,33 @@ class MockCVEngine:
         "e-1005",
     }
 
-    def __init__(self) -> None:
-        cascade_path = (
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    def __init__(self, assets_directory: str | Path | None = None) -> None:
+        repository_root = Path(__file__).resolve().parent.parent
+        self.assets_directory = Path(
+            assets_directory or repository_root / "assets"
         )
-        self.detector = cv2.CascadeClassifier(cascade_path)
-        if self.detector.empty():
-            raise RuntimeError("OpenCV Haar cascade could not be loaded")
-        self.reference_embeddings = self._build_reference_index()
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = 1
+        session_options.inter_op_num_threads = 1
+        providers = ["CPUExecutionProvider"]
+        self.scrfd_session = ort.InferenceSession(
+            str(self.assets_directory / "scrfd_500m.onnx"),
+            sess_options=session_options,
+            providers=providers,
+        )
+        self.minifasnet_session = ort.InferenceSession(
+            str(self.assets_directory / "minifasnetv2.onnx"),
+            sess_options=session_options,
+            providers=providers,
+        )
+        self.arcface_session = ort.InferenceSession(
+            str(self.assets_directory / "arcface_r50.onnx"),
+            sess_options=session_options,
+            providers=providers,
+        )
+        self.reference_embeddings = self._build_reference_embeddings(
+            repository_root / "e-1001.jpg"
+        )
 
     def load_image(self, image_path: str) -> LoadedImage:
         path = Path(image_path)
@@ -110,9 +130,7 @@ class MockCVEngine:
         event_id: str,
         metadata: Metadata,
     ) -> QualityResult:
-        variance = float(
-            cv2.Laplacian(image.gray, cv2.CV_64F).var()
-        )
+        variance = float(cv2.Laplacian(image.gray, cv2.CV_64F).var())
         normalized = variance / (variance + 100.0)
         scenario_id = self.scenario_id(image_path, event_id)
         if scenario_id == "e-1002" or metadata.occlusion_hint is not None:
@@ -125,14 +143,13 @@ class MockCVEngine:
         )
 
     def detect_and_align_scrfd(self, image: LoadedImage) -> DetectionResult:
-        detected = self.detector.detectMultiScale(
-            image.gray,
-            scaleFactor=1.1,
-            minNeighbors=3,
-            minSize=(40, 40),
-        )
-        boxes = [tuple(int(value) for value in box) for box in detected]
-        if not boxes:
+        tensor = self._preprocess(image.bgr, (160, 160))
+        output = self.scrfd_session.run(
+            None,
+            {self.scrfd_session.get_inputs()[0].name: tensor},
+        )[0][0]
+        x1, y1, x2, y2, confidence = [float(value) for value in output]
+        if confidence < 0.50:
             return DetectionResult(
                 observation=FaceObservation(
                     face_detected=False,
@@ -142,11 +159,14 @@ class MockCVEngine:
                 ),
                 aligned_face=None,
             )
-        x, y, width, height = max(
-            boxes,
-            key=lambda box: box[2] * box[3],
-        )
-        face_crop = image.bgr[y : y + height, x : x + width]
+        image_height, image_width = image.bgr.shape[:2]
+        left = int(np.clip(min(x1, x2), 0.0, 0.95) * image_width)
+        top = int(np.clip(min(y1, y2), 0.0, 0.95) * image_height)
+        right = int(np.clip(max(x1, x2), 0.05, 1.0) * image_width)
+        bottom = int(np.clip(max(y1, y2), 0.05, 1.0) * image_height)
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+        face_crop = image.bgr[top:bottom, left:right]
         aligned_face = cv2.resize(
             face_crop,
             self.canonical_face_size,
@@ -155,25 +175,32 @@ class MockCVEngine:
         return DetectionResult(
             observation=FaceObservation(
                 face_detected=True,
-                face_count=len(boxes),
+                face_count=1,
                 aligned=True,
-                bbox=[float(x), float(y), float(width), float(height)],
+                bbox=[float(left), float(top), float(width), float(height)],
             ),
             aligned_face=aligned_face,
         )
 
     def assess_liveness_minifasnet(
         self,
+        aligned_face: UInt8Image,
         image_path: str,
         event_id: str,
         metadata: Metadata,
     ) -> float:
+        tensor = self._preprocess(aligned_face, self.canonical_face_size)
+        probabilities = self.minifasnet_session.run(
+            None,
+            {self.minifasnet_session.get_inputs()[0].name: tensor},
+        )[0][0]
+        score = float(probabilities[1])
         scenario_id = self.scenario_id(image_path, event_id)
         if scenario_id == "e-1003" or metadata.spoofing_suspected:
-            return 0.20
-        if metadata.occlusion_hint == "mask":
-            return 0.20
-        return 0.95
+            score = 0.20
+        elif metadata.occlusion_hint == "mask":
+            score = 0.20
+        return round(max(0.0, min(1.0, score)), 6)
 
     def extract_embedding_arcface(
         self,
@@ -181,7 +208,12 @@ class MockCVEngine:
         image_path: str,
         event_id: str,
     ) -> FloatVector:
-        raw_embedding = self._histogram_embedding(aligned_face)
+        tensor = self._preprocess(aligned_face, self.canonical_face_size)
+        output = self.arcface_session.run(
+            None,
+            {self.arcface_session.get_inputs()[0].name: tensor},
+        )[0][0].astype(np.float32)
+        raw_embedding = self._normalize(output)
         scenario_id = self.scenario_id(image_path, event_id)
         if scenario_id in {"e-1001", "e-1005"}:
             return self._candidate_with_scores(0.94, 0.61, scenario_id)
@@ -199,7 +231,7 @@ class MockCVEngine:
             )
             candidate = 0.94 * reference
             candidate = candidate + np.sqrt(1.0 - 0.94**2) * direction
-            return (candidate / np.linalg.norm(candidate)).astype(np.float32)
+            return self._normalize(candidate)
         return raw_embedding
 
     def is_occluded(
@@ -213,13 +245,6 @@ class MockCVEngine:
             or metadata.occlusion_hint is not None
         )
 
-    def index_matrix(self) -> tuple[list[str], NDArray[np.float32]]:
-        employee_ids = list(self.reference_embeddings)
-        matrix = np.vstack(
-            [self.reference_embeddings[employee_id] for employee_id in employee_ids]
-        ).astype(np.float32)
-        return employee_ids, matrix
-
     @classmethod
     def scenario_id(cls, image_path: str, event_id: str) -> str:
         normalized_event_id = event_id.lower()
@@ -227,13 +252,23 @@ class MockCVEngine:
             return normalized_event_id
         return Path(image_path).stem.lower()
 
-    def _build_reference_index(self) -> dict[str, FloatVector]:
-        reference_path = Path(__file__).resolve().parent.parent / "e-1001.jpg"
+    def _build_reference_embeddings(
+        self,
+        reference_path: Path,
+    ) -> dict[str, FloatVector]:
         reference_image = self.load_image(str(reference_path))
         detection = self.detect_and_align_scrfd(reference_image)
         if detection.aligned_face is None:
             raise RuntimeError("Reference face could not be detected")
-        employee_vector = self._histogram_embedding(detection.aligned_face)
+        tensor = self._preprocess(
+            detection.aligned_face,
+            self.canonical_face_size,
+        )
+        output = self.arcface_session.run(
+            None,
+            {self.arcface_session.get_inputs()[0].name: tensor},
+        )[0][0].astype(np.float32)
+        employee_vector = self._normalize(output)
         nearby_direction = _orthogonal_direction(
             [employee_vector],
             "emp-7310-reference-direction",
@@ -248,9 +283,7 @@ class MockCVEngine:
         )
         return {
             "emp-4821": employee_vector,
-            "emp-7310": (
-                nearby_vector / np.linalg.norm(nearby_vector)
-            ).astype(np.float32),
+            "emp-7310": self._normalize(nearby_vector),
             "emp-9999": terminated_vector,
         }
 
@@ -264,9 +297,7 @@ class MockCVEngine:
         second = self.reference_embeddings["emp-7310"]
         correlation = float(np.dot(employee, second))
         denominator = np.sqrt(1.0 - correlation**2)
-        nearby_direction = (
-            second - correlation * employee
-        ) / denominator
+        nearby_direction = (second - correlation * employee) / denominator
         third_direction = _orthogonal_direction(
             [employee, nearby_direction.astype(np.float32)],
             f"{key}-candidate-direction",
@@ -281,36 +312,22 @@ class MockCVEngine:
         candidate = employee_score * employee
         candidate = candidate + nearby_component * nearby_direction
         candidate = candidate + np.sqrt(remaining) * third_direction
-        return (candidate / np.linalg.norm(candidate)).astype(np.float32)
+        return self._normalize(candidate)
 
     @staticmethod
-    def _histogram_embedding(aligned_face: UInt8Image) -> FloatVector:
-        gray = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2GRAY)
-        gray_histogram = cv2.calcHist(
-            [gray],
-            [0],
-            None,
-            [256],
-            [0, 256],
-        ).reshape(-1)
-        channel_histograms = [
-            cv2.calcHist(
-                [aligned_face],
-                [channel],
-                None,
-                [64],
-                [0, 256],
-            ).reshape(-1)
-            for channel in range(3)
-        ]
-        spatial_statistics = cv2.resize(
-            gray,
-            (8, 8),
-            interpolation=cv2.INTER_AREA,
-        ).reshape(-1)
-        vector = np.concatenate(
-            [gray_histogram, *channel_histograms, spatial_statistics]
-        ).astype(np.float32)
+    def _preprocess(
+        image: UInt8Image,
+        size: tuple[int, int],
+    ) -> NDArray[np.float32]:
+        resized = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        normalized = rgb.astype(np.float32) / 255.0
+        tensor = np.transpose(normalized, (2, 0, 1))[np.newaxis, ...]
+        return np.ascontiguousarray(tensor, dtype=np.float32)
+
+    @staticmethod
+    def _normalize(vector: NDArray[np.float32]) -> FloatVector:
+        vector = np.asarray(vector, dtype=np.float32).reshape(512)
         norm = float(np.linalg.norm(vector))
         if norm == 0.0:
             return np.zeros(512, dtype=np.float32)

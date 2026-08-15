@@ -2,9 +2,10 @@ from threading import Lock
 from time import perf_counter
 
 import numpy as np
+import faiss
 
+from app.cv_engine import ImageLoadError, MatchResult, OnnxCVEngine
 from app.logger import AuditLogger
-from app.mock_cv import ImageLoadError, MatchResult, MockCVEngine
 from app.schemas import (
     AccessRequest,
     AccessResponse,
@@ -38,11 +39,21 @@ class AccessDecisionEngine:
 
     def __init__(
         self,
-        cv_engine: MockCVEngine | None = None,
+        cv_engine: OnnxCVEngine | None = None,
         audit_logger: AuditLogger | None = None,
     ) -> None:
-        self.cv_engine = cv_engine or MockCVEngine()
+        self.cv_engine = cv_engine or OnnxCVEngine()
         self.audit_logger = audit_logger or AuditLogger()
+        self._employee_ids = list(self.cv_engine.reference_embeddings)
+        reference_matrix = np.vstack(
+            [
+                self.cv_engine.reference_embeddings[employee_id]
+                for employee_id in self._employee_ids
+            ]
+        ).astype(np.float32)
+        faiss.normalize_L2(reference_matrix)
+        self._faiss_index = faiss.IndexFlatIP(512)
+        self._faiss_index.add(reference_matrix)
         self._event_results: dict[str, AccessResponse] = {}
         self._last_allowed_at: dict[tuple[str, str], float] = {}
         self._state_lock = Lock()
@@ -139,6 +150,7 @@ class AccessDecisionEngine:
 
         stage_started = perf_counter()
         liveness_score = self.cv_engine.assess_liveness_minifasnet(
+            detection.aligned_face,
             request.image_path,
             request.event_id,
             request.metadata,
@@ -271,18 +283,20 @@ class AccessDecisionEngine:
         self,
         candidate: np.ndarray,
     ) -> MatchResult:
-        employee_ids, index = self.cv_engine.index_matrix()
-        scores = np.dot(index, candidate)
-        ranked_indices = np.argsort(scores)[::-1]
-        best_index = int(ranked_indices[0])
-        second_index = int(ranked_indices[1])
-        best_score = round(float(np.clip(scores[best_index], 0.0, 1.0)), 6)
+        query = np.ascontiguousarray(
+            candidate.reshape(1, 512),
+            dtype=np.float32,
+        )
+        faiss.normalize_L2(query)
+        scores, indices = self._faiss_index.search(query, 2)
+        best_index = int(indices[0, 0])
+        best_score = round(float(np.clip(scores[0, 0], 0.0, 1.0)), 6)
         second_score = round(
-            float(np.clip(scores[second_index], 0.0, 1.0)),
+            float(np.clip(scores[0, 1], 0.0, 1.0)),
             6,
         )
         return MatchResult(
-            employee_id=employee_ids[best_index],
+            employee_id=self._employee_ids[best_index],
             match_score=best_score,
             second_best_score=second_score,
             margin_to_second_best=round(

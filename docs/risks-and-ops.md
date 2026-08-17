@@ -1,5 +1,3 @@
-# Risks, Operations & Governance: risks-and-ops.md
-
 ## 1. Low-Latency, Reliability & Degradation
 
 ### Edge vs Center Architecture

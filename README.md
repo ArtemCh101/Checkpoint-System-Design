@@ -58,10 +58,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | Событие | Проверка | Решение | Команда турникету |
 |---|---|---|---|
 | `e-1001` | Качественный кадр, живое лицо, уверенное совпадение и действующие права | `allow` | `open` |
-| `e-1002` | Низкое качество и перекрытие лица | `manual_review` | `keep_closed` |
-| `e-1003` | Провал liveness, имитация spoofing-атаки | `manual_review` | `keep_closed` |
+| `e-1002` | Низкое качество и перекрытие лица | `deny` | `keep_closed` |
+| `e-1003` | Провал liveness, имитация spoofing-атаки | `deny` | `keep_closed` |
 | `e-1004` | Слишком малая разница между двумя лучшими кандидатами | `manual_review` | `keep_closed` |
-| `e-1005` | Offline-режим и кэш старше 120 минут | `manual_review` | `keep_closed` |
+| `e-1005` | Offline-режим и кэш старше 24 часов | `deny` | `keep_closed` |
 
 ## Аудит
 
